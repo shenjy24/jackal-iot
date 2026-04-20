@@ -48,7 +48,6 @@ public class ParquetService {
     private static final String MINIO_SECRET_KEY = "minioadmin";
     private static final String DEFAULT_BUCKET = "parquet";
     private static final Path DIR;
-    private static final String TABLE1_PARTITION_ROOT = "parquet";
     private static final long ONE_HOUR_MS = 3_600_000L;
     private static final long EAST8_OFFSET_MS = 8 * ONE_HOUR_MS;
 
@@ -400,8 +399,6 @@ public class ParquetService {
 
     private static String buildPartitionDirForTable1(String date, int hour) {
         return new StringBuilder(32)
-                .append(TABLE1_PARTITION_ROOT)
-                .append("/")
                 .append("date=")
                 .append(date)
                 .append("/hour=")
@@ -517,13 +514,8 @@ public class ParquetService {
     }
 
     private void queryTable1FromLocalHivePartitions(MillisRange range) {
-        String localGlob = DIR.resolve(TABLE1_PARTITION_ROOT)
-                .resolve("date=*")
-                .resolve("hour=*")
-                .resolve("*.parquet")
-                .toAbsolutePath()
-                .toString()
-                .replace("\\", "/");
+        String baseDir = DIR.toAbsolutePath().toString().replace("\\", "/");
+        String localGlob = baseDir + "/date=*/hour=*/*.parquet";
         String startDate = TimeUtil.hiveDateValue(range.lo());
         String endDate = TimeUtil.hiveDateValue(range.hi());
         int startHour = TimeUtil.hiveHourValue(range.lo());
