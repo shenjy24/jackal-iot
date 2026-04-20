@@ -1,7 +1,10 @@
 package com.tech.service;
 
 import com.tech.util.TimeUtil;
-import io.minio.*;
+import io.minio.BucketExistsArgs;
+import io.minio.MakeBucketArgs;
+import io.minio.MinioClient;
+import io.minio.PutObjectArgs;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
@@ -35,7 +38,9 @@ public class ParquetService {
     private static final String DEFAULT_BUCKET = "parquet";
     private static final Path DIR;
 
-    /** MinIO Hive key: parquet/date=yyyy-MM-dd/hour=H/table1_{exportStart}_{exportEnd}.parquet */
+    /**
+     * MinIO Hive key: parquet/date=yyyy-MM-dd/hour=H/table1_{exportStart}_{exportEnd}.parquet
+     */
     private static final String TABLE1_HIVE_GLOB = "s3://%s/parquet/date=*/hour=*/*.parquet";
 
     private static final String TABLE1_AVRO_SCHEMA = """
@@ -230,8 +235,8 @@ public class ParquetService {
      * 不再先 list 对象，依赖 DuckDB 的 hive partition pruning。
      */
     public void readParquetFromMinio(String startTime, String endTime, String bucketName) {
-        long lo = Math.min(TimeUtil.parseCompactTimestamp(startTime), TimeUtil.parseCompactTimestamp(endTime));
-        long hi = Math.max(TimeUtil.parseCompactTimestamp(startTime), TimeUtil.parseCompactTimestamp(endTime));
+        long lo = TimeUtil.parseCompactTimestamp(startTime);
+        long hi = TimeUtil.parseCompactTimestamp(endTime);
         readParquetFromMinioByHivePartition(bucketName, lo, hi);
     }
 
@@ -247,8 +252,8 @@ public class ParquetService {
      * 指定精确对象名读取（不做区间匹配，仅在 SQL 里做 {@code time BETWEEN}）。
      */
     public void readParquetFromMinio(String bucketName, String objectName, String startTime, String endTime) {
-        long lo = Math.min(TimeUtil.parseCompactTimestamp(startTime), TimeUtil.parseCompactTimestamp(endTime));
-        long hi = Math.max(TimeUtil.parseCompactTimestamp(startTime), TimeUtil.parseCompactTimestamp(endTime));
+        long lo = TimeUtil.parseCompactTimestamp(startTime);
+        long hi = TimeUtil.parseCompactTimestamp(endTime);
         readParquetFromSingleObject(bucketName, objectName, lo, hi);
     }
 
