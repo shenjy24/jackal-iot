@@ -77,4 +77,11 @@ class ApplicationTests {
         String url = parquetService.toParquetAndUploadToMinio();
         log.info("url: {}", url);
     }
+
+    @Test
+    void testReadMinio() {
+        long startTime = 1755619200000L;
+        long endTime = 1776646863240L;
+        parquetService.readParquetFromMinio(startTime, endTime);
+    }
 }

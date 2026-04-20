@@ -14,11 +14,13 @@ import org.apache.parquet.io.OutputFile;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 
 @Slf4j
@@ -33,6 +35,13 @@ public class ParquetService {
     private static final String MINIO_SECRET_KEY = "minioadmin";
     private static final String DEFAULT_BUCKET = "parquet";
     private static final Path DIR;
+
+    /**
+     * {@code INSTALL httpfs} 写入本机 DuckDB 扩展目录，同一 JVM 内只需尝试一次（升级 DuckDB 版本后需重新拉取）。
+     * {@code LOAD httpfs} 载入当前连接对应的数据库，每个新 Connection 仍要执行。
+     */
+    private static final Object HTTPFS_INSTALL_LOCK = new Object();
+    private static volatile boolean httpfsJvmInstallAttempted;
 
     static {
         DIR = Path.of("./data/parquet");
@@ -105,7 +114,7 @@ public class ParquetService {
                 """);
 
         long startTime = TimeUtil.getTimestamp("2025-08-20 00:00:00");
-        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
+        long endTime = System.currentTimeMillis();
 
         String sql = """
                     SELECT time, device_id, temperature, humidity
@@ -161,32 +170,102 @@ public class ParquetService {
     }
 
     public void readParquetFromMinio(long startTime, long endTime) {
-        String objectName = "table1_%d_%d.parquet".formatted(startTime, endTime);
-        readParquetFromMinio(DEFAULT_BUCKET, objectName, startTime, endTime);
+        readParquetFromMinio(startTime, endTime, DEFAULT_BUCKET);
     }
 
+    public void readParquetFromMinio(long startTime, long endTime, String bucketName) {
+        String objectName = "table1_%d_%d.parquet".formatted(startTime, endTime);
+        readParquetFromMinio(bucketName, objectName, startTime, endTime);
+    }
+
+    /**
+     * 通过 DuckDB {@code httpfs} 以 S3 兼容协议直连 MinIO 读取 Parquet（按需 Range 请求），不落盘整文件。
+     */
     public void readParquetFromMinio(String bucketName, String objectName, long startTime, long endTime) {
-        Path parquetPath = DIR.resolve(objectName);
+        String s3Uri = "s3://%s/%s".formatted(bucketName, objectName);
+        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
+            ensureHttpfsLoaded(conn);
+            applyMinioS3Settings(conn);
 
-        try {
-            MinioClient minioClient = MinioClient.builder()
-                    .endpoint(MINIO_ENDPOINT)
-                    .credentials(MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
-                    .build();
+            String escapedUri = sqlStringLiteral(s3Uri);
+            String query = """
+                        SELECT time, device_id, temperature, humidity
+                        FROM read_parquet('%s')
+                        WHERE time BETWEEN %d AND %d
+                        LIMIT 10
+                    """.formatted(escapedUri, startTime, endTime);
 
-            minioClient.downloadObject(
-                    DownloadObjectArgs.builder()
-                            .bucket(bucketName)
-                            .object(objectName)
-                            .filename(parquetPath.toAbsolutePath().toString())
-                            .build()
-            );
+            log.info("Parquet 从 MinIO 直连读取: {}", s3Uri);
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(query)) {
+                while (rs.next()) {
+                    long time = rs.getLong("time");
+                    String deviceId = rs.getString("device_id");
+                    double temp = rs.getDouble("temperature");
+                    double hum = rs.getDouble("humidity");
 
-            log.info("Parquet 从 MinIO 下载完成: {}", parquetPath.toAbsolutePath());
-            readParquetFile(parquetPath, startTime, endTime);
+                    log.info("time={}, device={}, temp={}, hum={}", time, deviceId, temp, hum);
+                }
+            }
         } catch (Exception e) {
             log.error("从 MinIO 读取 Parquet 异常", e);
         }
+    }
+
+    /**
+     * 每个连接执行 {@code LOAD httpfs}；仅在首次加载失败时对本 JVM 同步执行一次 {@code INSTALL httpfs}（见类字段说明）。
+     * DuckDB 在某次 SQL 失败时可能关闭当前 {@link Statement}，失败后必须换新的 Statement。
+     */
+    private static void ensureHttpfsLoaded(Connection conn) throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("LOAD httpfs");
+            return;
+        } catch (SQLException ignored) {
+            // 扩展未装进本机目录或未载入当前库
+        }
+        synchronized (HTTPFS_INSTALL_LOCK) {
+            if (!httpfsJvmInstallAttempted) {
+                httpfsJvmInstallAttempted = true;
+                try (Statement s = conn.createStatement()) {
+                    try {
+                        s.execute("INSTALL httpfs");
+                    } catch (SQLException ignored) {
+                        // 已安装、版本已存在或离线；扩展目录已有文件时后续 LOAD 仍可能成功
+                    }
+                }
+            }
+        }
+        try (Statement s = conn.createStatement()) {
+            s.execute("LOAD httpfs");
+        }
+    }
+
+    /**
+     * 将 {@link #MINIO_ENDPOINT} 解析为 DuckDB S3 设置（endpoint 不含协议，与 MinIO 文档一致）。
+     */
+    private static void applyMinioS3Settings(Connection conn) throws SQLException {
+        URI uri = URI.create(MINIO_ENDPOINT);
+        String scheme = uri.getScheme();
+        boolean useSsl = "https".equalsIgnoreCase(scheme);
+        int port = uri.getPort();
+        String host = uri.getHost();
+        if (host == null) {
+            throw new IllegalStateException("无效的 MinIO endpoint: " + MINIO_ENDPOINT);
+        }
+        String endpoint = port > 0 ? host + ":" + port : host;
+
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("SET s3_region = 'us-east-1'");
+            stmt.execute("SET s3_url_style = 'path'");
+            stmt.execute("SET s3_endpoint = '%s'".formatted(sqlStringLiteral(endpoint)));
+            stmt.execute("SET s3_access_key_id = '%s'".formatted(sqlStringLiteral(MINIO_ACCESS_KEY)));
+            stmt.execute("SET s3_secret_access_key = '%s'".formatted(sqlStringLiteral(MINIO_SECRET_KEY)));
+            stmt.execute(useSsl ? "SET s3_use_ssl = true" : "SET s3_use_ssl = false");
+        }
+    }
+
+    private static String sqlStringLiteral(String s) {
+        return s.replace("'", "''");
     }
 
     private void readParquetFile(Path parquetPath, long startTime, long endTime) {
