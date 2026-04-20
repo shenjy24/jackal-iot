@@ -38,9 +38,9 @@ class ApplicationTests {
     @Test
     void testSave() {
         Table1 table1 = new Table1();
-        table1.setTime(System.currentTimeMillis());
+        table1.setTime(TimeUtil.getTimestamp("2026-04-20 13:50:55"));
         table1.setRegion("Hamburg");
-        table1.setPlantId("1002");
+        table1.setPlantId("1003");
         table1.setDeviceId("100");
         table1.setTemperature(80.0);
         table1.setHumidity(40.5);
@@ -74,16 +74,16 @@ class ApplicationTests {
 
     @Test
     void testToMinio() {
-        long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
-        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
+        long startTime = TimeUtil.getTimestamp("2026-04-20 00:00:00");
+        long endTime = TimeUtil.getTimestamp("2026-04-21 00:00:00");
         String url = parquetService.exportTable1ToMinio(startTime, endTime);
         log.info("url: {}", url);
     }
 
     @Test
     void testReadMinio() {
-        long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
-        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
+        long startTime = TimeUtil.getTimestamp("2026-04-20 14:00:00");
+        long endTime = TimeUtil.getTimestamp("2026-04-20 14:20:00");
         parquetService.queryTable1FromMinioHive(startTime, endTime);
     }
 }

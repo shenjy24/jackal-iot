@@ -26,6 +26,8 @@ import java.nio.file.Path;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * table1 的 Parquet 导出与查询。
@@ -145,49 +147,58 @@ public class ParquetService {
     }
 
     /**
-     * 从 IoTDB 查询 {@code [exportStartMs, exportEndMs)} 的 table1 数据写入指定 {@link OutputFile}。
+     * 一次性查询范围内 table1 数据（避免按小时多次请求 IoTDB）。
      */
-    private boolean exportTable1FromIotdbToParquet(OutputFile outputFile, long exportStartMs, long exportEndMs) {
-        Schema schema = new Schema.Parser().parse(TABLE1_AVRO_SCHEMA);
-        // IoTDB JDBC 2.0.6 不支持 prepareStatement；时间范围为 long，直接拼入 SQL。
+    private List<Table1Row> fetchTable1Rows(Connection conn, MillisRange range) throws SQLException {
         String sql = """
                     SELECT time, device_id, temperature, humidity
                     FROM table1
                     WHERE time >= %d AND time < %d
                     ORDER BY time
-                """.formatted(exportStartMs, exportEndMs);
-
-        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD);
-             Statement stmt = conn.createStatement(
-                     ResultSet.TYPE_FORWARD_ONLY,
-                     ResultSet.CONCUR_READ_ONLY
-             );
-             ParquetWriter<GenericRecord> writer =
-                     AvroParquetWriter.<GenericRecord>builder(outputFile)
-                             .withSchema(schema)
-                             .withCompressionCodec(CompressionCodecName.ZSTD)
-                             .build()
-        ) {
+                """.formatted(range.lo(), range.hi());
+        ArrayList<Table1Row> rows = new ArrayList<>();
+        try (Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
             stmt.setFetchSize(1000);
             try (ResultSet rs = stmt.executeQuery(sql)) {
                 while (rs.next()) {
-                    GenericRecord record = new GenericData.Record(schema);
-                    record.put("time", rs.getLong("time"));
-                    record.put("device_id", rs.getString("device_id"));
+                    long time = rs.getLong("time");
+                    String deviceId = rs.getString("device_id");
 
                     double temp = rs.getDouble("temperature");
-                    record.put("temperature", rs.wasNull() ? null : temp);
+                    Double temperature = rs.wasNull() ? null : temp;
 
                     double hum = rs.getDouble("humidity");
-                    record.put("humidity", rs.wasNull() ? null : hum);
+                    Double humidity = rs.wasNull() ? null : hum;
 
-                    writer.write(record);
+                    rows.add(new Table1Row(time, deviceId, temperature, humidity));
                 }
             }
-            return true;
+        }
+        return rows;
+    }
+
+    private int writeRowsToParquet(OutputFile outputFile, List<Table1Row> rows) {
+        if (rows.isEmpty()) {
+            return 0;
+        }
+        Schema schema = new Schema.Parser().parse(TABLE1_AVRO_SCHEMA);
+        try (ParquetWriter<GenericRecord> writer =
+                     AvroParquetWriter.<GenericRecord>builder(outputFile)
+                             .withSchema(schema)
+                             .withCompressionCodec(CompressionCodecName.ZSTD)
+                             .build()) {
+            for (Table1Row row : rows) {
+                GenericRecord record = new GenericData.Record(schema);
+                record.put("time", row.time());
+                record.put("device_id", row.deviceId());
+                record.put("temperature", row.temperature());
+                record.put("humidity", row.humidity());
+                writer.write(record);
+            }
+            return rows.size();
         } catch (Exception e) {
             log.error("Parquet 生成异常", e);
-            return false;
+            return -1;
         }
     }
 
@@ -209,49 +220,70 @@ public class ParquetService {
 
     private int exportTable1ToLocalPartitionFiles(MillisRange range) {
         int exported = 0;
-        for (MillisRange shard : splitByHour(range)) {
-            String shardStart = TimeUtil.toCompactTimestamp(shard.lo());
-            String shardEnd = TimeUtil.toCompactTimestamp(shard.hi());
-            String date = TimeUtil.hiveDateValue(shard.lo());
-            int hour = TimeUtil.hiveHourValue(shard.lo());
-            Path partitionDir = DIR.resolve(buildPartitionDirForTable1(date, hour));
-            try {
-                Files.createDirectories(partitionDir);
-                Path parquetPath = partitionDir.resolve(buildTable1ParquetFilename(shardStart, shardEnd));
-                if (exportTable1FromIotdbToParquet(new LocalOutputFile(parquetPath), shard.lo(), shard.hi())) {
-                    exported++;
+        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD)) {
+            List<Table1Row> allRows = fetchTable1Rows(conn, range);
+            Map<Long, List<Table1Row>> rowsByHour = partitionRowsByEast8Hour(allRows);
+            for (Map.Entry<Long, List<Table1Row>> entry : rowsByHour.entrySet()) {
+                long hourStartMs = entry.getKey();
+                long hourEndMs = hourStartMs + ONE_HOUR_MS;
+                String shardStart = TimeUtil.toCompactTimestamp(hourStartMs);
+                String shardEnd = TimeUtil.toCompactTimestamp(hourEndMs);
+                String date = TimeUtil.hiveDateValue(hourStartMs);
+                int hour = TimeUtil.hiveHourValue(hourStartMs);
+                Path partitionDir = DIR.resolve(buildPartitionDirForTable1(date, hour));
+                try {
+                    Files.createDirectories(partitionDir);
+                    Path parquetPath = partitionDir.resolve(buildTable1ParquetFilename(shardStart, shardEnd));
+                    int rowCount = writeRowsToParquet(new LocalOutputFile(parquetPath), entry.getValue());
+                    if (rowCount > 0) {
+                        exported++;
+                    } else if (rowCount == 0) {
+                        Files.deleteIfExists(parquetPath);
+                    }
+                } catch (IOException e) {
+                    log.error("创建本地分区目录失败: {}", partitionDir, e);
                 }
-            } catch (IOException e) {
-                log.error("创建本地分区目录失败: {}", partitionDir, e);
             }
+        } catch (Exception e) {
+            log.error("本地分区 Parquet 导出异常", e);
         }
         return exported;
     }
 
     private int exportTable1ToMinioPartitionFiles(MinioClient client, String bucketName, MillisRange range) {
         int uploaded = 0;
-        for (MillisRange shard : splitByHour(range)) {
-            String shardStart = TimeUtil.toCompactTimestamp(shard.lo());
-            String shardEnd = TimeUtil.toCompactTimestamp(shard.hi());
-            InMemoryOutputFile outputFile = new InMemoryOutputFile();
-            if (!exportTable1FromIotdbToParquet(outputFile, shard.lo(), shard.hi())) {
-                continue;
+        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD)) {
+            List<Table1Row> allRows = fetchTable1Rows(conn, range);
+            Map<Long, List<Table1Row>> rowsByHour = partitionRowsByEast8Hour(allRows);
+            for (Map.Entry<Long, List<Table1Row>> entry : rowsByHour.entrySet()) {
+                long hourStartMs = entry.getKey();
+                long hourEndMs = hourStartMs + ONE_HOUR_MS;
+                String shardStart = TimeUtil.toCompactTimestamp(hourStartMs);
+                String shardEnd = TimeUtil.toCompactTimestamp(hourEndMs);
+                InMemoryOutputFile outputFile = new InMemoryOutputFile();
+                int rowCount = writeRowsToParquet(outputFile, entry.getValue());
+                if (rowCount <= 0) {
+                    log.debug("分片无数据，跳过上传: [{} - {})", shardStart, shardEnd);
+                    continue;
+                }
+                byte[] bytes = outputFile.toByteArray();
+                String objectKey = buildMinioHiveObjectKeyForTable1(shardStart, shardEnd, hourStartMs);
+                try (ByteArrayInputStream in = new ByteArrayInputStream(bytes)) {
+                    client.putObject(
+                            PutObjectArgs.builder()
+                                    .bucket(bucketName)
+                                    .object(objectKey)
+                                    .contentType("application/octet-stream")
+                                    .stream(in, bytes.length, -1)
+                                    .build()
+                    );
+                    uploaded++;
+                } catch (Exception e) {
+                    log.error("上传分区 Parquet 到 MinIO 失败: {}", objectKey, e);
+                }
             }
-            byte[] bytes = outputFile.toByteArray();
-            String objectKey = buildMinioHiveObjectKeyForTable1(shardStart, shardEnd, shard.lo());
-            try (ByteArrayInputStream in = new ByteArrayInputStream(bytes)) {
-                client.putObject(
-                        PutObjectArgs.builder()
-                                .bucket(bucketName)
-                                .object(objectKey)
-                                .contentType("application/octet-stream")
-                                .stream(in, bytes.length, -1)
-                                .build()
-                );
-                uploaded++;
-            } catch (Exception e) {
-                log.error("上传分区 Parquet 到 MinIO 失败: {}", objectKey, e);
-            }
+        } catch (Exception e) {
+            log.error("分区 Parquet 上传前查询 IoTDB 异常", e);
         }
         return uploaded;
     }
@@ -430,24 +462,21 @@ public class ParquetService {
     }
 
     /**
-     * 将查询区间切分为按整点边界对齐的小时分片，保证每个分片仅落入一个 date/hour 分区。
+     * 按东八区整点将数据分桶：同一桶的记录都属于同一 date/hour 分区。
      */
-    private static List<MillisRange> splitByHour(MillisRange range) {
-        List<MillisRange> shards = new ArrayList<>();
-        long cursor = range.lo();
-        while (cursor < range.hi()) {
-            long nextHour = nextEast8HourBoundary(cursor);
-            long end = Math.min(nextHour, range.hi());
-            shards.add(new MillisRange(cursor, end));
-            cursor = end;
+    private static Map<Long, List<Table1Row>> partitionRowsByEast8Hour(List<Table1Row> rows) {
+        Map<Long, List<Table1Row>> buckets = new TreeMap<>();
+        for (Table1Row row : rows) {
+            long hourStart = floorToEast8Hour(row.time());
+            buckets.computeIfAbsent(hourStart, ignored -> new ArrayList<>()).add(row);
         }
-        return shards;
+        return buckets;
     }
 
-    private static long nextEast8HourBoundary(long epochMilli) {
+    private static long floorToEast8Hour(long epochMilli) {
         long shifted = epochMilli + EAST8_OFFSET_MS;
-        long next = ((shifted / ONE_HOUR_MS) + 1) * ONE_HOUR_MS;
-        return next - EAST8_OFFSET_MS;
+        long floored = (shifted / ONE_HOUR_MS) * ONE_HOUR_MS;
+        return floored - EAST8_OFFSET_MS;
     }
 
     private static void logTable1Row(ResultSet rs) throws SQLException {
@@ -469,6 +498,9 @@ public class ParquetService {
         static MillisRange ordered(long a, long b) {
             return a <= b ? new MillisRange(a, b) : new MillisRange(b, a);
         }
+    }
+
+    private record Table1Row(long time, String deviceId, Double temperature, Double humidity) {
     }
 
     /**
