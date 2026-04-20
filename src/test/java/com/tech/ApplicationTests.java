@@ -74,7 +74,9 @@ class ApplicationTests {
 
     @Test
     void testToMinio() {
-        String url = parquetService.toParquetAndUploadToMinio();
+        long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
+        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
+        String url = parquetService.toParquetAndUploadToMinio(startTime, endTime);
         log.info("url: {}", url);
     }
 
