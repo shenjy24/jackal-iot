@@ -24,6 +24,8 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * table1 的 Parquet 导出与查询。
@@ -44,6 +46,9 @@ public class ParquetService {
     private static final String MINIO_SECRET_KEY = "minioadmin";
     private static final String DEFAULT_BUCKET = "parquet";
     private static final Path DIR;
+    private static final String TABLE1_PARTITION_ROOT = "parquet";
+    private static final long ONE_HOUR_MS = 3_600_000L;
+    private static final long EAST8_OFFSET_MS = 8 * ONE_HOUR_MS;
 
     /**
      * DuckDB 读 MinIO 上 table1 的 Hive 布局通配路径。
@@ -85,14 +90,20 @@ public class ParquetService {
     public void exportTable1ToLocalParquet() {
         String startCompact = TimeUtil.toCompactTimestamp(TimeUtil.getTimestamp("2025-08-20 00:00:00"));
         String endCompact = TimeUtil.toCompactTimestamp(System.currentTimeMillis());
-        long startMs = TimeUtil.parseCompactTimestamp(startCompact);
-        long endMs = TimeUtil.parseCompactTimestamp(endCompact);
+        exportTable1ToLocalParquet(startCompact, endCompact);
+    }
 
-        Path parquetPath = DIR.resolve(buildTable1ParquetFilename(startCompact, endCompact));
+    public void exportTable1ToLocalParquet(String startTime, String endTime) {
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        int generated = exportTable1ToLocalPartitionFiles(range);
+        log.info("本地分区 Parquet 导出完成: count={}, range=[{}, {}]", generated, startTime, endTime);
+    }
 
-        if (exportTable1FromIotdbToParquet(new LocalOutputFile(parquetPath), startMs, endMs)) {
-            log.info("Parquet 生成完成: {}", parquetPath.toAbsolutePath());
-        }
+    public void exportTable1ToLocalParquet(long startTime, long endTime) {
+        exportTable1ToLocalParquet(
+                TimeUtil.toCompactTimestamp(startTime),
+                TimeUtil.toCompactTimestamp(endTime)
+        );
     }
 
     public String exportTable1ToMinio(String startTime, String endTime) {
@@ -111,34 +122,14 @@ public class ParquetService {
      * 将 IoTDB table1 导出为 Parquet 并上传到 MinIO（内存写入，不落本地文件）。
      */
     public String exportTable1ToMinio(String startTime, String endTime, String bucketName) {
-        long startMs = TimeUtil.parseCompactTimestamp(startTime);
-        long endMs = TimeUtil.parseCompactTimestamp(endTime);
-        String objectKey = buildMinioHiveObjectKeyForTable1(startTime, endTime, startMs);
-
-        InMemoryOutputFile outputFile = new InMemoryOutputFile();
-        if (!exportTable1FromIotdbToParquet(outputFile, startMs, endMs)) {
-            return null;
-        }
-        byte[] bytes = outputFile.toByteArray();
-
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
         try {
             MinioClient client = createMinioClient();
             ensureBucketExists(client, bucketName);
-
-            try (ByteArrayInputStream in = new ByteArrayInputStream(bytes)) {
-                client.putObject(
-                        PutObjectArgs.builder()
-                                .bucket(bucketName)
-                                .object(objectKey)
-                                .contentType("application/octet-stream")
-                                .stream(in, bytes.length, -1)
-                                .build()
-                );
-            }
-
-            String objectUrl = "%s/%s/%s".formatted(MINIO_ENDPOINT, bucketName, objectKey);
-            log.info("Parquet 上传 MinIO 完成 (size={} bytes): {}", bytes.length, objectUrl);
-            return objectUrl;
+            int uploaded = exportTable1ToMinioPartitionFiles(client, bucketName, range);
+            String prefixUrl = "%s/%s/".formatted(MINIO_ENDPOINT, bucketName);
+            log.info("分区 Parquet 上传 MinIO 完成: count={}, prefix={}", uploaded, prefixUrl);
+            return prefixUrl;
         } catch (Exception e) {
             log.error("Parquet 上传 MinIO 异常", e);
             return null;
@@ -216,13 +207,61 @@ public class ParquetService {
         }
     }
 
+    private int exportTable1ToLocalPartitionFiles(MillisRange range) {
+        int exported = 0;
+        for (MillisRange shard : splitByHour(range)) {
+            String shardStart = TimeUtil.toCompactTimestamp(shard.lo());
+            String shardEnd = TimeUtil.toCompactTimestamp(shard.hi());
+            String date = TimeUtil.hiveDateValue(shard.lo());
+            int hour = TimeUtil.hiveHourValue(shard.lo());
+            Path partitionDir = DIR.resolve(buildPartitionDirForTable1(date, hour));
+            try {
+                Files.createDirectories(partitionDir);
+                Path parquetPath = partitionDir.resolve(buildTable1ParquetFilename(shardStart, shardEnd));
+                if (exportTable1FromIotdbToParquet(new LocalOutputFile(parquetPath), shard.lo(), shard.hi())) {
+                    exported++;
+                }
+            } catch (IOException e) {
+                log.error("创建本地分区目录失败: {}", partitionDir, e);
+            }
+        }
+        return exported;
+    }
+
+    private int exportTable1ToMinioPartitionFiles(MinioClient client, String bucketName, MillisRange range) {
+        int uploaded = 0;
+        for (MillisRange shard : splitByHour(range)) {
+            String shardStart = TimeUtil.toCompactTimestamp(shard.lo());
+            String shardEnd = TimeUtil.toCompactTimestamp(shard.hi());
+            InMemoryOutputFile outputFile = new InMemoryOutputFile();
+            if (!exportTable1FromIotdbToParquet(outputFile, shard.lo(), shard.hi())) {
+                continue;
+            }
+            byte[] bytes = outputFile.toByteArray();
+            String objectKey = buildMinioHiveObjectKeyForTable1(shardStart, shardEnd, shard.lo());
+            try (ByteArrayInputStream in = new ByteArrayInputStream(bytes)) {
+                client.putObject(
+                        PutObjectArgs.builder()
+                                .bucket(bucketName)
+                                .object(objectKey)
+                                .contentType("application/octet-stream")
+                                .stream(in, bytes.length, -1)
+                                .build()
+                );
+                uploaded++;
+            } catch (Exception e) {
+                log.error("上传分区 Parquet 到 MinIO 失败: {}", objectKey, e);
+            }
+        }
+        return uploaded;
+    }
+
     /**
      * 从本地目录读取 table1 Parquet（文件名由紧凑时间拼接）。
      */
     public void queryTable1FromLocalParquet(String startTime, String endTime) {
         MillisRange range = parseOrderedCompactRange(startTime, endTime);
-        Path parquetPath = DIR.resolve(buildTable1ParquetFilename(startTime, endTime));
-        queryTable1FromLocalParquetFile(parquetPath, range);
+        queryTable1FromLocalHivePartitions(range);
     }
 
     public void queryTable1FromLocalParquet(long startTime, long endTime) {
@@ -360,6 +399,17 @@ public class ParquetService {
                 .toString();
     }
 
+    private static String buildPartitionDirForTable1(String date, int hour) {
+        return new StringBuilder(32)
+                .append(TABLE1_PARTITION_ROOT)
+                .append("/")
+                .append("date=")
+                .append(date)
+                .append("/hour=")
+                .append(hour)
+                .toString();
+    }
+
     private static String buildTable1ParquetFilename(String startCompact, String endCompact) {
         return new StringBuilder(48)
                 .append("table1_")
@@ -377,6 +427,27 @@ public class ParquetService {
         long a = TimeUtil.parseCompactTimestamp(startCompact);
         long b = TimeUtil.parseCompactTimestamp(endCompact);
         return MillisRange.ordered(a, b);
+    }
+
+    /**
+     * 将查询区间切分为按整点边界对齐的小时分片，保证每个分片仅落入一个 date/hour 分区。
+     */
+    private static List<MillisRange> splitByHour(MillisRange range) {
+        List<MillisRange> shards = new ArrayList<>();
+        long cursor = range.lo();
+        while (cursor < range.hi()) {
+            long nextHour = nextEast8HourBoundary(cursor);
+            long end = Math.min(nextHour, range.hi());
+            shards.add(new MillisRange(cursor, end));
+            cursor = end;
+        }
+        return shards;
+    }
+
+    private static long nextEast8HourBoundary(long epochMilli) {
+        long shifted = epochMilli + EAST8_OFFSET_MS;
+        long next = ((shifted / ONE_HOUR_MS) + 1) * ONE_HOUR_MS;
+        return next - EAST8_OFFSET_MS;
     }
 
     private static void logTable1Row(ResultSet rs) throws SQLException {
@@ -455,28 +526,47 @@ public class ParquetService {
         return s.replace("'", "''");
     }
 
-    private void queryTable1FromLocalParquetFile(Path parquetPath, MillisRange range) {
-        String filePath = parquetPath.toAbsolutePath().toString().replace("\\", "/");
+    private void queryTable1FromLocalHivePartitions(MillisRange range) {
+        String localGlob = DIR.resolve(TABLE1_PARTITION_ROOT)
+                .resolve("date=*")
+                .resolve("hour=*")
+                .resolve("*.parquet")
+                .toAbsolutePath()
+                .toString()
+                .replace("\\", "/");
+        String startDate = TimeUtil.hiveDateValue(range.lo());
+        String endDate = TimeUtil.hiveDateValue(range.hi());
+        int startHour = TimeUtil.hiveHourValue(range.lo());
+        int endHour = TimeUtil.hiveHourValue(range.hi());
 
         String sql = """
                     SELECT time, device_id, temperature, humidity
-                    FROM read_parquet(?)
-                    WHERE time BETWEEN ? AND ?
+                    FROM read_parquet(?, hive_partitioning = 1)
+                    WHERE "date" BETWEEN ? AND ?
+                      AND time BETWEEN ? AND ?
+                      AND ("date" > ? OR CAST("hour" AS INTEGER) >= ?)
+                      AND ("date" < ? OR CAST("hour" AS INTEGER) <= ?)
                     LIMIT 10
                 """;
 
         try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, filePath);
-            ps.setLong(2, range.lo());
-            ps.setLong(3, range.hi());
+            ps.setString(1, localGlob);
+            ps.setString(2, startDate);
+            ps.setString(3, endDate);
+            ps.setLong(4, range.lo());
+            ps.setLong(5, range.hi());
+            ps.setString(6, startDate);
+            ps.setInt(7, startHour);
+            ps.setString(8, endDate);
+            ps.setInt(9, endHour);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     logTable1Row(rs);
                 }
             }
         } catch (Exception e) {
-            log.error("读取 Parquet 文件异常", e);
+            log.error("读取本地分区 Parquet 异常", e);
         }
     }
 
