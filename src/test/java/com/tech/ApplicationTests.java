@@ -62,7 +62,9 @@ class ApplicationTests {
 
     @Test
     void testToParquet() {
-        parquetService.exportTable1ToLocalParquet();
+        long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
+        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
+        parquetService.exportTable1ToLocalParquet(startTime, endTime);
     }
 
     @Test

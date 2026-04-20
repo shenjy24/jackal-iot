@@ -89,42 +89,21 @@ public class ParquetService {
     /**
      * 将 IoTDB table1 导出为本地 Parquet（使用内置默认时间范围）。
      */
-    public void exportTable1ToLocalParquet() {
-        String startCompact = TimeUtil.toCompactTimestamp(TimeUtil.getTimestamp("2025-08-20 00:00:00"));
-        String endCompact = TimeUtil.toCompactTimestamp(System.currentTimeMillis());
-        exportTable1ToLocalParquet(startCompact, endCompact);
-    }
-
-    public void exportTable1ToLocalParquet(String startTime, String endTime) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+    public void exportTable1ToLocalParquet(long startTime, long endTime) {
+        MillisRange range = MillisRange.ordered(startTime, endTime);
         int generated = exportTable1ToLocalPartitionFiles(range);
         log.info("本地分区 Parquet 导出完成: count={}, range=[{}, {}]", generated, startTime, endTime);
     }
 
-    public void exportTable1ToLocalParquet(long startTime, long endTime) {
-        exportTable1ToLocalParquet(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime)
-        );
-    }
-
-    public String exportTable1ToMinio(String startTime, String endTime) {
-        return exportTable1ToMinio(startTime, endTime, DEFAULT_BUCKET);
-    }
-
     public String exportTable1ToMinio(long startTime, long endTime) {
-        return exportTable1ToMinio(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime),
-                DEFAULT_BUCKET
-        );
+        return exportTable1ToMinio(startTime, endTime, DEFAULT_BUCKET);
     }
 
     /**
      * 将 IoTDB table1 导出为 Parquet 并上传到 MinIO（内存写入，不落本地文件）。
      */
-    public String exportTable1ToMinio(String startTime, String endTime, String bucketName) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+    public String exportTable1ToMinio(long startTime, long endTime, String bucketName) {
+        MillisRange range = MillisRange.ordered(startTime, endTime);
         try {
             MinioClient client = createMinioClient();
             ensureBucketExists(client, bucketName);
@@ -136,14 +115,6 @@ public class ParquetService {
             log.error("Parquet 上传 MinIO 异常", e);
             return null;
         }
-    }
-
-    public String exportTable1ToMinio(long startTime, long endTime, String bucketName) {
-        return exportTable1ToMinio(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime),
-                bucketName
-        );
     }
 
     /**
@@ -291,44 +262,21 @@ public class ParquetService {
     /**
      * 从本地目录读取 table1 Parquet（文件名由紧凑时间拼接）。
      */
-    public void queryTable1FromLocalParquet(String startTime, String endTime) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+    public void queryTable1FromLocalParquet(long startTime, long endTime) {
+        MillisRange range = MillisRange.ordered(startTime, endTime);
         queryTable1FromLocalHivePartitions(range);
     }
 
-    public void queryTable1FromLocalParquet(long startTime, long endTime) {
-        queryTable1FromLocalParquet(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime)
-        );
-    }
-
-    public void queryTable1FromMinioHive(String startTime, String endTime) {
-        queryTable1FromMinioHive(startTime, endTime, DEFAULT_BUCKET);
-    }
-
     public void queryTable1FromMinioHive(long startTime, long endTime) {
-        queryTable1FromMinioHive(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime),
-                DEFAULT_BUCKET
-        );
+        queryTable1FromMinioHive(startTime, endTime, DEFAULT_BUCKET);
     }
 
     /**
      * 从 MinIO Hive 分区路径通配读取，使用分区列 {@code date}/{@code hour} + {@code time} 过滤。
      */
-    public void queryTable1FromMinioHive(String startTime, String endTime, String bucketName) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
-        queryTable1FromMinioHiveGlob(bucketName, range);
-    }
-
     public void queryTable1FromMinioHive(long startTime, long endTime, String bucketName) {
-        queryTable1FromMinioHive(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime),
-                bucketName
-        );
+        MillisRange range = MillisRange.ordered(startTime, endTime);
+        queryTable1FromMinioHiveGlob(bucketName, range);
     }
 
     /**
@@ -337,40 +285,17 @@ public class ParquetService {
      * @return 执行计划文本行
      */
     public List<String> explainQueryTable1FromMinioHive(
-            String startTime,
-            String endTime,
+            long startTime,
+            long endTime,
             String bucketName,
             boolean analyze
     ) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        MillisRange range = MillisRange.ordered(startTime, endTime);
         return explainMinioHiveQueryPlan(bucketName, range, analyze);
     }
 
-    public List<String> explainQueryTable1FromMinioHive(String startTime, String endTime, String bucketName) {
-        return explainQueryTable1FromMinioHive(startTime, endTime, bucketName, false);
-    }
-
     public List<String> explainQueryTable1FromMinioHive(long startTime, long endTime) {
-        return explainQueryTable1FromMinioHive(
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime), DEFAULT_BUCKET, false);
-    }
-
-    /**
-     * 按指定 MinIO 对象 key 读取 table1 Parquet。
-     */
-    public void queryTable1FromMinioObject(String bucketName, String objectKey, String startTime, String endTime) {
-        MillisRange range = parseOrderedCompactRange(startTime, endTime);
-        queryTable1FromMinioObjectKey(bucketName, objectKey, range);
-    }
-
-    public void queryTable1FromMinioObject(String bucketName, String objectKey, long startTime, long endTime) {
-        queryTable1FromMinioObject(
-                bucketName,
-                objectKey,
-                TimeUtil.toCompactTimestamp(startTime),
-                TimeUtil.toCompactTimestamp(endTime)
-        );
+        return explainQueryTable1FromMinioHive(startTime, endTime, DEFAULT_BUCKET, false);
     }
 
     private void queryTable1FromMinioHiveGlob(String bucketName, MillisRange range) {
@@ -403,21 +328,21 @@ public class ParquetService {
                 stmt.execute("SET explain_output = 'all'");
             }
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            bindMinioHiveTable1QueryParams(ps, s3Glob, range);
-            try (ResultSet rs = ps.executeQuery()) {
-                int colCount = rs.getMetaData().getColumnCount();
-                while (rs.next()) {
-                    String key = rs.getString(1);
-                    String value = colCount >= 2 ? rs.getString(2) : null;
-                    String line = value != null && !value.isBlank()
-                            ? "%s:%n%s".formatted(key, value)
-                            : key;
-                    if (line != null && !line.isBlank()) {
-                        planLines.add(line);
-                        log.info("EXPLAIN: {}", line);
+                bindMinioHiveTable1QueryParams(ps, s3Glob, range);
+                try (ResultSet rs = ps.executeQuery()) {
+                    int colCount = rs.getMetaData().getColumnCount();
+                    while (rs.next()) {
+                        String key = rs.getString(1);
+                        String value = colCount >= 2 ? rs.getString(2) : null;
+                        String line = value != null && !value.isBlank()
+                                ? "%s:%n%s".formatted(key, value)
+                                : key;
+                        if (line != null && !line.isBlank()) {
+                            planLines.add(line);
+                            log.info("EXPLAIN: {}", line);
+                        }
                     }
                 }
-            }
             }
         } catch (Exception e) {
             log.error("执行 MinIO Hive 查询 EXPLAIN 异常", e);
@@ -451,30 +376,6 @@ public class ParquetService {
         ps.setInt(7, startHour);
         ps.setString(8, endDate);
         ps.setInt(9, endHour);
-    }
-
-    private void queryTable1FromMinioObjectKey(String bucketName, String objectKey, MillisRange range) {
-        String s3Uri = "s3://%s/%s".formatted(bucketName, objectKey);
-        String sql = """
-                SELECT time, device_id, temperature, humidity
-                FROM read_parquet(?, hive_partitioning = 1)
-                WHERE time BETWEEN ? AND ?
-                ORDER BY time
-                """;
-        try (Connection conn = openDuckDbWithMinioS3()) {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, s3Uri);
-                ps.setLong(2, range.lo());
-                ps.setLong(3, range.hi());
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        logTable1Row(rs);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.error("从 MinIO 读取单对象 Parquet 异常", e);
-        }
     }
 
     /**
@@ -516,15 +417,6 @@ public class ParquetService {
                 .append(endCompact)
                 .append(".parquet")
                 .toString();
-    }
-
-    /**
-     * 解析两个紧凑时间字符串，并规范为 [lo, hi]（毫秒），避免调用方把起止写反导致 BETWEEN 无效。
-     */
-    private static MillisRange parseOrderedCompactRange(String startCompact, String endCompact) {
-        long a = TimeUtil.parseCompactTimestamp(startCompact);
-        long b = TimeUtil.parseCompactTimestamp(endCompact);
-        return MillisRange.ordered(a, b);
     }
 
     /**
