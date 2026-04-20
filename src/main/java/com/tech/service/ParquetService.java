@@ -332,6 +332,31 @@ public class ParquetService {
     }
 
     /**
+     * 执行 MinIO Hive 查询的执行计划（EXPLAIN / EXPLAIN ANALYZE），用于确认是否触发分区裁剪。
+     *
+     * @return 执行计划文本行
+     */
+    public List<String> explainQueryTable1FromMinioHive(
+            String startTime,
+            String endTime,
+            String bucketName,
+            boolean analyze
+    ) {
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        return explainMinioHiveQueryPlan(bucketName, range, analyze);
+    }
+
+    public List<String> explainQueryTable1FromMinioHive(String startTime, String endTime, String bucketName) {
+        return explainQueryTable1FromMinioHive(startTime, endTime, bucketName, false);
+    }
+
+    public List<String> explainQueryTable1FromMinioHive(long startTime, long endTime) {
+        return explainQueryTable1FromMinioHive(
+                TimeUtil.toCompactTimestamp(startTime),
+                TimeUtil.toCompactTimestamp(endTime), DEFAULT_BUCKET, false);
+    }
+
+    /**
      * 按指定 MinIO 对象 key 读取 table1 Parquet。
      */
     public void queryTable1FromMinioObject(String bucketName, String objectKey, String startTime, String endTime) {
@@ -350,32 +375,12 @@ public class ParquetService {
 
     private void queryTable1FromMinioHiveGlob(String bucketName, MillisRange range) {
         String s3Glob = TABLE1_MINIO_HIVE_GLOB.formatted(bucketName);
-        String startDate = TimeUtil.hiveDateValue(range.lo());
-        String endDate = TimeUtil.hiveDateValue(range.hi());
-        int startHour = TimeUtil.hiveHourValue(range.lo());
-        int endHour = TimeUtil.hiveHourValue(range.hi());
-        String sql = """
-                SELECT time, device_id, temperature, humidity
-                FROM read_parquet(?, hive_partitioning = 1)
-                WHERE "date" BETWEEN ? AND ?
-                  AND time BETWEEN ? AND ?
-                  AND ("date" > ? OR CAST("hour" AS INTEGER) >= ?)
-                  AND ("date" < ? OR CAST("hour" AS INTEGER) <= ?)
-                ORDER BY time
-                """;
+        String sql = buildMinioHiveTable1QuerySql("");
 
         try (Connection conn = openDuckDbWithMinioS3()) {
             log.info("Parquet 从 MinIO 直连读取 (hive glob): {}", s3Glob);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, s3Glob);
-                ps.setString(2, startDate);
-                ps.setString(3, endDate);
-                ps.setLong(4, range.lo());
-                ps.setLong(5, range.hi());
-                ps.setString(6, startDate);
-                ps.setInt(7, startHour);
-                ps.setString(8, endDate);
-                ps.setInt(9, endHour);
+                bindMinioHiveTable1QueryParams(ps, s3Glob, range);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         logTable1Row(rs);
@@ -385,6 +390,67 @@ public class ParquetService {
         } catch (Exception e) {
             log.error("从 MinIO 读取 Parquet 异常", e);
         }
+    }
+
+    private List<String> explainMinioHiveQueryPlan(String bucketName, MillisRange range, boolean analyze) {
+        String s3Glob = TABLE1_MINIO_HIVE_GLOB.formatted(bucketName);
+        String explainPrefix = analyze ? "EXPLAIN ANALYZE " : "EXPLAIN ";
+        String sql = buildMinioHiveTable1QuerySql(explainPrefix);
+        List<String> planLines = new ArrayList<>();
+        try (Connection conn = openDuckDbWithMinioS3()) {
+            try (Statement stmt = conn.createStatement()) {
+                // 返回更完整的 explain 结构，便于观察是否发生 partition pruning。
+                stmt.execute("SET explain_output = 'all'");
+            }
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            bindMinioHiveTable1QueryParams(ps, s3Glob, range);
+            try (ResultSet rs = ps.executeQuery()) {
+                int colCount = rs.getMetaData().getColumnCount();
+                while (rs.next()) {
+                    String key = rs.getString(1);
+                    String value = colCount >= 2 ? rs.getString(2) : null;
+                    String line = value != null && !value.isBlank()
+                            ? "%s:%n%s".formatted(key, value)
+                            : key;
+                    if (line != null && !line.isBlank()) {
+                        planLines.add(line);
+                        log.info("EXPLAIN: {}", line);
+                    }
+                }
+            }
+            }
+        } catch (Exception e) {
+            log.error("执行 MinIO Hive 查询 EXPLAIN 异常", e);
+        }
+        return planLines;
+    }
+
+    private static String buildMinioHiveTable1QuerySql(String prefix) {
+        return """
+                %sSELECT time, device_id, temperature, humidity
+                FROM read_parquet(?, hive_partitioning = 1)
+                WHERE "date" BETWEEN ? AND ?
+                  AND time BETWEEN ? AND ?
+                  AND ("date" > ? OR CAST("hour" AS INTEGER) >= ?)
+                  AND ("date" < ? OR CAST("hour" AS INTEGER) <= ?)
+                ORDER BY time
+                """.formatted(prefix);
+    }
+
+    private static void bindMinioHiveTable1QueryParams(PreparedStatement ps, String s3Glob, MillisRange range) throws SQLException {
+        String startDate = TimeUtil.hiveDateValue(range.lo());
+        String endDate = TimeUtil.hiveDateValue(range.hi());
+        int startHour = TimeUtil.hiveHourValue(range.lo());
+        int endHour = TimeUtil.hiveHourValue(range.hi());
+        ps.setString(1, s3Glob);
+        ps.setString(2, startDate);
+        ps.setString(3, endDate);
+        ps.setLong(4, range.lo());
+        ps.setLong(5, range.hi());
+        ps.setString(6, startDate);
+        ps.setInt(7, startHour);
+        ps.setString(8, endDate);
+        ps.setInt(9, endHour);
     }
 
     private void queryTable1FromMinioObjectKey(String bucketName, String objectKey, MillisRange range) {

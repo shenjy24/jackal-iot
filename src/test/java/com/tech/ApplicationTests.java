@@ -86,4 +86,11 @@ class ApplicationTests {
         long endTime = TimeUtil.getTimestamp("2026-04-20 14:20:00");
         parquetService.queryTable1FromMinioHive(startTime, endTime);
     }
+
+    @Test
+    void testExplain() {
+        long startTime = TimeUtil.getTimestamp("2026-04-20 14:00:00");
+        long endTime = TimeUtil.getTimestamp("2026-04-20 14:20:00");
+        parquetService.explainQueryTable1FromMinioHive(startTime, endTime);
+    }
 }
