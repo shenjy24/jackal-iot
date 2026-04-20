@@ -25,13 +25,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.*;
 
+/**
+ * table1 的 Parquet 导出与查询。
+ * <ul>
+ *   <li>{@code exportTable1*}：IoTDB → Parquet（本地或 MinIO）</li>
+ *   <li>{@code queryTable1From*}：DuckDB 读取 Parquet（本地文件 / MinIO Hive 通配 / 指定对象 key）</li>
+ * </ul>
+ */
 @Slf4j
 @Service
 public class ParquetService {
 
-    private static final String JDBC_URL = "jdbc:iotdb://8.138.14.210:6667/database1?sql_dialect=table";
-    private static final String USER = "root";
-    private static final String PASSWORD = "root";
+    private static final String IOTDB_JDBC_URL = "jdbc:iotdb://8.138.14.210:6667/database1?sql_dialect=table";
+    private static final String IOTDB_USER = "root";
+    private static final String IOTDB_PASSWORD = "root";
     private static final String MINIO_ENDPOINT = "http://127.0.0.1:9000";
     private static final String MINIO_ACCESS_KEY = "minioadmin";
     private static final String MINIO_SECRET_KEY = "minioadmin";
@@ -39,9 +46,9 @@ public class ParquetService {
     private static final Path DIR;
 
     /**
-     * MinIO Hive key: parquet/date=yyyy-MM-dd/hour=H/table1_{exportStart}_{exportEnd}.parquet
+     * DuckDB 读 MinIO 上 table1 的 Hive 布局通配路径。
      */
-    private static final String TABLE1_HIVE_GLOB = "s3://%s/parquet/date=*/hour=*/*.parquet";
+    private static final String TABLE1_MINIO_HIVE_GLOB = "s3://%s/date=*/hour=*/*.parquet";
 
     private static final String TABLE1_AVRO_SCHEMA = """
             {
@@ -72,26 +79,28 @@ public class ParquetService {
         }
     }
 
-    public void toParquet() {
-        String startTime = TimeUtil.toCompactTimestamp(TimeUtil.getTimestamp("2025-08-20 00:00:00"));
-        String endTime = TimeUtil.toCompactTimestamp(System.currentTimeMillis());
-        long startEpochMilli = TimeUtil.parseCompactTimestamp(startTime);
-        long endEpochMilli = TimeUtil.parseCompactTimestamp(endTime);
+    /**
+     * 将 IoTDB table1 导出为本地 Parquet（使用内置默认时间范围）。
+     */
+    public void exportTable1ToLocalParquet() {
+        String startCompact = TimeUtil.toCompactTimestamp(TimeUtil.getTimestamp("2025-08-20 00:00:00"));
+        String endCompact = TimeUtil.toCompactTimestamp(System.currentTimeMillis());
+        long startMs = TimeUtil.parseCompactTimestamp(startCompact);
+        long endMs = TimeUtil.parseCompactTimestamp(endCompact);
 
-        String fileName = buildTable1FileName(startTime, endTime);
-        Path parquetPath = DIR.resolve(fileName);
+        Path parquetPath = DIR.resolve(buildTable1ParquetFilename(startCompact, endCompact));
 
-        if (writeParquet(new LocalOutputFile(parquetPath), startEpochMilli, endEpochMilli)) {
+        if (exportTable1FromIotdbToParquet(new LocalOutputFile(parquetPath), startMs, endMs)) {
             log.info("Parquet 生成完成: {}", parquetPath.toAbsolutePath());
         }
     }
 
-    public String toParquetAndUploadToMinio(String startTime, String endTime) {
-        return toParquetAndUploadToMinio(startTime, endTime, DEFAULT_BUCKET);
+    public String exportTable1ToMinio(String startTime, String endTime) {
+        return exportTable1ToMinio(startTime, endTime, DEFAULT_BUCKET);
     }
 
-    public String toParquetAndUploadToMinio(long startTime, long endTime) {
-        return toParquetAndUploadToMinio(
+    public String exportTable1ToMinio(long startTime, long endTime) {
+        return exportTable1ToMinio(
                 TimeUtil.toCompactTimestamp(startTime),
                 TimeUtil.toCompactTimestamp(endTime),
                 DEFAULT_BUCKET
@@ -99,35 +108,35 @@ public class ParquetService {
     }
 
     /**
-     * 直接把 Parquet 写到内存缓冲再上传到 MinIO，不生成本地文件。
+     * 将 IoTDB table1 导出为 Parquet 并上传到 MinIO（内存写入，不落本地文件）。
      */
-    public String toParquetAndUploadToMinio(String startTime, String endTime, String bucketName) {
-        long startEpochMilli = TimeUtil.parseCompactTimestamp(startTime);
-        long endEpochMilli = TimeUtil.parseCompactTimestamp(endTime);
-        String objectName = table1HiveObjectKey(startTime, endTime, startEpochMilli);
+    public String exportTable1ToMinio(String startTime, String endTime, String bucketName) {
+        long startMs = TimeUtil.parseCompactTimestamp(startTime);
+        long endMs = TimeUtil.parseCompactTimestamp(endTime);
+        String objectKey = buildMinioHiveObjectKeyForTable1(startTime, endTime, startMs);
 
         InMemoryOutputFile outputFile = new InMemoryOutputFile();
-        if (!writeParquet(outputFile, startEpochMilli, endEpochMilli)) {
+        if (!exportTable1FromIotdbToParquet(outputFile, startMs, endMs)) {
             return null;
         }
         byte[] bytes = outputFile.toByteArray();
 
         try {
-            MinioClient minioClient = minioClient();
-            ensureBucket(minioClient, bucketName);
+            MinioClient client = createMinioClient();
+            ensureBucketExists(client, bucketName);
 
             try (ByteArrayInputStream in = new ByteArrayInputStream(bytes)) {
-                minioClient.putObject(
+                client.putObject(
                         PutObjectArgs.builder()
                                 .bucket(bucketName)
-                                .object(objectName)
+                                .object(objectKey)
                                 .contentType("application/octet-stream")
                                 .stream(in, bytes.length, -1)
                                 .build()
                 );
             }
 
-            String objectUrl = "%s/%s/%s".formatted(MINIO_ENDPOINT, bucketName, objectName);
+            String objectUrl = "%s/%s/%s".formatted(MINIO_ENDPOINT, bucketName, objectKey);
             log.info("Parquet 上传 MinIO 完成 (size={} bytes): {}", bytes.length, objectUrl);
             return objectUrl;
         } catch (Exception e) {
@@ -136,8 +145,8 @@ public class ParquetService {
         }
     }
 
-    public String toParquetAndUploadToMinio(long startTime, long endTime, String bucketName) {
-        return toParquetAndUploadToMinio(
+    public String exportTable1ToMinio(long startTime, long endTime, String bucketName) {
+        return exportTable1ToMinio(
                 TimeUtil.toCompactTimestamp(startTime),
                 TimeUtil.toCompactTimestamp(endTime),
                 bucketName
@@ -145,9 +154,9 @@ public class ParquetService {
     }
 
     /**
-     * 从 IoTDB 查询 {@code [startTime, endTime)} 的 table1 数据写入指定 {@link OutputFile}。
+     * 从 IoTDB 查询 {@code [exportStartMs, exportEndMs)} 的 table1 数据写入指定 {@link OutputFile}。
      */
-    private boolean writeParquet(OutputFile outputFile, long startTime, long endTime) {
+    private boolean exportTable1FromIotdbToParquet(OutputFile outputFile, long exportStartMs, long exportEndMs) {
         Schema schema = new Schema.Parser().parse(TABLE1_AVRO_SCHEMA);
         // IoTDB JDBC 2.0.6 不支持 prepareStatement；时间范围为 long，直接拼入 SQL。
         String sql = """
@@ -155,9 +164,9 @@ public class ParquetService {
                     FROM table1
                     WHERE time >= %d AND time < %d
                     ORDER BY time
-                """.formatted(startTime, endTime);
+                """.formatted(exportStartMs, exportEndMs);
 
-        try (Connection conn = DriverManager.getConnection(JDBC_URL, USER, PASSWORD);
+        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD);
              Statement stmt = conn.createStatement(
                      ResultSet.TYPE_FORWARD_ONLY,
                      ResultSet.CONCUR_READ_ONLY
@@ -191,14 +200,14 @@ public class ParquetService {
         }
     }
 
-    private MinioClient minioClient() {
+    private static MinioClient createMinioClient() {
         return MinioClient.builder()
                 .endpoint(MINIO_ENDPOINT)
                 .credentials(MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
                 .build();
     }
 
-    private void ensureBucket(MinioClient minioClient, String bucketName) throws Exception {
+    private static void ensureBucketExists(MinioClient minioClient, String bucketName) throws Exception {
         boolean exists = minioClient.bucketExists(
                 BucketExistsArgs.builder().bucket(bucketName).build()
         );
@@ -207,23 +216,28 @@ public class ParquetService {
         }
     }
 
-    public void readParquet(String startTime, String endTime) {
-        long startEpochMilli = TimeUtil.parseCompactTimestamp(startTime);
-        long endEpochMilli = TimeUtil.parseCompactTimestamp(endTime);
-        Path parquetPath = DIR.resolve(buildTable1FileName(startTime, endTime));
-        readParquetFile(parquetPath, startEpochMilli, endEpochMilli);
+    /**
+     * 从本地目录读取 table1 Parquet（文件名由紧凑时间拼接）。
+     */
+    public void queryTable1FromLocalParquet(String startTime, String endTime) {
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        Path parquetPath = DIR.resolve(buildTable1ParquetFilename(startTime, endTime));
+        queryTable1FromLocalParquetFile(parquetPath, range);
     }
 
-    public void readParquet(long startTime, long endTime) {
-        readParquet(TimeUtil.toCompactTimestamp(startTime), TimeUtil.toCompactTimestamp(endTime));
+    public void queryTable1FromLocalParquet(long startTime, long endTime) {
+        queryTable1FromLocalParquet(
+                TimeUtil.toCompactTimestamp(startTime),
+                TimeUtil.toCompactTimestamp(endTime)
+        );
     }
 
-    public void readParquetFromMinio(String startTime, String endTime) {
-        readParquetFromMinio(startTime, endTime, DEFAULT_BUCKET);
+    public void queryTable1FromMinioHive(String startTime, String endTime) {
+        queryTable1FromMinioHive(startTime, endTime, DEFAULT_BUCKET);
     }
 
-    public void readParquetFromMinio(long startTime, long endTime) {
-        readParquetFromMinio(
+    public void queryTable1FromMinioHive(long startTime, long endTime) {
+        queryTable1FromMinioHive(
                 TimeUtil.toCompactTimestamp(startTime),
                 TimeUtil.toCompactTimestamp(endTime),
                 DEFAULT_BUCKET
@@ -231,17 +245,15 @@ public class ParquetService {
     }
 
     /**
-     * 直接读取 Hive 分区目录并使用分区列 {@code date}/{@code hour} + 列值 {@code time} 过滤。
-     * 不再先 list 对象，依赖 DuckDB 的 hive partition pruning。
+     * 从 MinIO Hive 分区路径通配读取，使用分区列 {@code date}/{@code hour} + {@code time} 过滤。
      */
-    public void readParquetFromMinio(String startTime, String endTime, String bucketName) {
-        long lo = TimeUtil.parseCompactTimestamp(startTime);
-        long hi = TimeUtil.parseCompactTimestamp(endTime);
-        readParquetFromMinioByHivePartition(bucketName, lo, hi);
+    public void queryTable1FromMinioHive(String startTime, String endTime, String bucketName) {
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        queryTable1FromMinioHiveGlob(bucketName, range);
     }
 
-    public void readParquetFromMinio(long startTime, long endTime, String bucketName) {
-        readParquetFromMinio(
+    public void queryTable1FromMinioHive(long startTime, long endTime, String bucketName) {
+        queryTable1FromMinioHive(
                 TimeUtil.toCompactTimestamp(startTime),
                 TimeUtil.toCompactTimestamp(endTime),
                 bucketName
@@ -249,32 +261,28 @@ public class ParquetService {
     }
 
     /**
-     * 指定精确对象名读取（不做区间匹配，仅在 SQL 里做 {@code time BETWEEN}）。
+     * 按指定 MinIO 对象 key 读取 table1 Parquet。
      */
-    public void readParquetFromMinio(String bucketName, String objectName, String startTime, String endTime) {
-        long lo = TimeUtil.parseCompactTimestamp(startTime);
-        long hi = TimeUtil.parseCompactTimestamp(endTime);
-        readParquetFromSingleObject(bucketName, objectName, lo, hi);
+    public void queryTable1FromMinioObject(String bucketName, String objectKey, String startTime, String endTime) {
+        MillisRange range = parseOrderedCompactRange(startTime, endTime);
+        queryTable1FromMinioObjectKey(bucketName, objectKey, range);
     }
 
-    public void readParquetFromMinio(String bucketName, String objectName, long startTime, long endTime) {
-        readParquetFromMinio(
+    public void queryTable1FromMinioObject(String bucketName, String objectKey, long startTime, long endTime) {
+        queryTable1FromMinioObject(
                 bucketName,
-                objectName,
+                objectKey,
                 TimeUtil.toCompactTimestamp(startTime),
                 TimeUtil.toCompactTimestamp(endTime)
         );
     }
 
-    /**
-     * 按 Hive 分区路径读取（parquet/date=.../hour=...），并直接在 SQL 中按分区列做裁剪。
-     */
-    private void readParquetFromMinioByHivePartition(String bucketName, long queryLo, long queryHi) {
-        String s3Glob = TABLE1_HIVE_GLOB.formatted(bucketName);
-        String startDate = TimeUtil.hiveDateValue(queryLo);
-        String endDate = TimeUtil.hiveDateValue(queryHi);
-        int startHour = TimeUtil.hiveHourValue(queryLo);
-        int endHour = TimeUtil.hiveHourValue(queryHi);
+    private void queryTable1FromMinioHiveGlob(String bucketName, MillisRange range) {
+        String s3Glob = TABLE1_MINIO_HIVE_GLOB.formatted(bucketName);
+        String startDate = TimeUtil.hiveDateValue(range.lo());
+        String endDate = TimeUtil.hiveDateValue(range.hi());
+        int startHour = TimeUtil.hiveHourValue(range.lo());
+        int endHour = TimeUtil.hiveHourValue(range.hi());
         String sql = """
                 SELECT time, device_id, temperature, humidity
                 FROM read_parquet(?, hive_partitioning = 1)
@@ -285,29 +293,21 @@ public class ParquetService {
                 ORDER BY time
                 """;
 
-        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
-            ensureHttpfsLoaded(conn);
-            applyMinioS3Settings(conn);
-
+        try (Connection conn = openDuckDbWithMinioS3()) {
             log.info("Parquet 从 MinIO 直连读取 (hive glob): {}", s3Glob);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, s3Glob);
                 ps.setString(2, startDate);
                 ps.setString(3, endDate);
-                ps.setLong(4, queryLo);
-                ps.setLong(5, queryHi);
+                ps.setLong(4, range.lo());
+                ps.setLong(5, range.hi());
                 ps.setString(6, startDate);
                 ps.setInt(7, startHour);
                 ps.setString(8, endDate);
                 ps.setInt(9, endHour);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        long time = rs.getLong("time");
-                        String deviceId = rs.getString("device_id");
-                        double temp = rs.getDouble("temperature");
-                        double hum = rs.getDouble("humidity");
-
-                        log.info("time={}, device={}, temp={}, hum={}", time, deviceId, temp, hum);
+                        logTable1Row(rs);
                     }
                 }
             }
@@ -316,31 +316,22 @@ public class ParquetService {
         }
     }
 
-    /**
-     * 指定精确对象 key 读取（不依赖 hive 分区裁剪）。
-     */
-    private void readParquetFromSingleObject(String bucketName, String objectName, long queryLo, long queryHi) {
-        String s3Uri = "s3://%s/%s".formatted(bucketName, objectName);
+    private void queryTable1FromMinioObjectKey(String bucketName, String objectKey, MillisRange range) {
+        String s3Uri = "s3://%s/%s".formatted(bucketName, objectKey);
         String sql = """
                 SELECT time, device_id, temperature, humidity
                 FROM read_parquet(?, hive_partitioning = 1)
                 WHERE time BETWEEN ? AND ?
                 ORDER BY time
                 """;
-        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:")) {
-            ensureHttpfsLoaded(conn);
-            applyMinioS3Settings(conn);
+        try (Connection conn = openDuckDbWithMinioS3()) {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, s3Uri);
-                ps.setLong(2, queryLo);
-                ps.setLong(3, queryHi);
+                ps.setLong(2, range.lo());
+                ps.setLong(3, range.hi());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        long time = rs.getLong("time");
-                        String deviceId = rs.getString("device_id");
-                        double temp = rs.getDouble("temperature");
-                        double hum = rs.getDouble("humidity");
-                        log.info("time={}, device={}, temp={}, hum={}", time, deviceId, temp, hum);
+                        logTable1Row(rs);
                     }
                 }
             }
@@ -349,27 +340,64 @@ public class ParquetService {
         }
     }
 
-    private static String table1HiveObjectKey(String exportStart, String exportEnd, long exportStartEpochMilli) {
-        String date = TimeUtil.hiveDateValue(exportStartEpochMilli);
-        int hour = TimeUtil.hiveHourValue(exportStartEpochMilli);
-        StringBuilder sb = new StringBuilder(96);
-        sb.append("parquet/date=")
+    /**
+     * MinIO 对象 key：{@code parquet/date=.../hour=.../table1_...parquet}
+     */
+    private static String buildMinioHiveObjectKeyForTable1(
+            String exportStartCompact,
+            String exportEndCompact,
+            long exportStartEpochMs
+    ) {
+        String date = TimeUtil.hiveDateValue(exportStartEpochMs);
+        int hour = TimeUtil.hiveHourValue(exportStartEpochMs);
+        return new StringBuilder(96)
+                .append("date=")
                 .append(date)
                 .append("/hour=")
                 .append(hour)
                 .append("/")
-                .append(buildTable1FileName(exportStart, exportEnd));
-        return sb.toString();
+                .append(buildTable1ParquetFilename(exportStartCompact, exportEndCompact))
+                .toString();
     }
 
-    private static String buildTable1FileName(String startTime, String endTime) {
-        StringBuilder sb = new StringBuilder(48);
-        sb.append("table1_")
-                .append(startTime)
+    private static String buildTable1ParquetFilename(String startCompact, String endCompact) {
+        return new StringBuilder(48)
+                .append("table1_")
+                .append(startCompact)
                 .append("_")
-                .append(endTime)
-                .append(".parquet");
-        return sb.toString();
+                .append(endCompact)
+                .append(".parquet")
+                .toString();
+    }
+
+    /**
+     * 解析两个紧凑时间字符串，并规范为 [lo, hi]（毫秒），避免调用方把起止写反导致 BETWEEN 无效。
+     */
+    private static MillisRange parseOrderedCompactRange(String startCompact, String endCompact) {
+        long a = TimeUtil.parseCompactTimestamp(startCompact);
+        long b = TimeUtil.parseCompactTimestamp(endCompact);
+        return MillisRange.ordered(a, b);
+    }
+
+    private static void logTable1Row(ResultSet rs) throws SQLException {
+        long time = rs.getLong("time");
+        String deviceId = rs.getString("device_id");
+        double temp = rs.getDouble("temperature");
+        double hum = rs.getDouble("humidity");
+        log.info("time={}, device={}, temp={}, hum={}", time, deviceId, temp, hum);
+    }
+
+    private Connection openDuckDbWithMinioS3() throws SQLException {
+        Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+        ensureHttpfsLoaded(conn);
+        applyMinioS3Settings(conn);
+        return conn;
+    }
+
+    private record MillisRange(long lo, long hi) {
+        static MillisRange ordered(long a, long b) {
+            return a <= b ? new MillisRange(a, b) : new MillisRange(b, a);
+        }
     }
 
     /**
@@ -427,10 +455,8 @@ public class ParquetService {
         return s.replace("'", "''");
     }
 
-    private void readParquetFile(Path parquetPath, long startTime, long endTime) {
+    private void queryTable1FromLocalParquetFile(Path parquetPath, MillisRange range) {
         String filePath = parquetPath.toAbsolutePath().toString().replace("\\", "/");
-        long lo = Math.min(startTime, endTime);
-        long hi = Math.max(startTime, endTime);
 
         String sql = """
                     SELECT time, device_id, temperature, humidity
@@ -442,16 +468,11 @@ public class ParquetService {
         try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, filePath);
-            ps.setLong(2, lo);
-            ps.setLong(3, hi);
+            ps.setLong(2, range.lo());
+            ps.setLong(3, range.hi());
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    long time = rs.getLong("time");
-                    String deviceId = rs.getString("device_id");
-                    double temp = rs.getDouble("temperature");
-                    double hum = rs.getDouble("humidity");
-
-                    log.info("time={}, device={}, temp={}, hum={}", time, deviceId, temp, hum);
+                    logTable1Row(rs);
                 }
             }
         } catch (Exception e) {

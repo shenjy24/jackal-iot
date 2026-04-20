@@ -62,21 +62,21 @@ class ApplicationTests {
 
     @Test
     void testToParquet() {
-        parquetService.toParquet();
+        parquetService.exportTable1ToLocalParquet();
     }
 
     @Test
     void testReadParquet() {
         long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
         long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
-        parquetService.readParquet(startTime, endTime);
+        parquetService.queryTable1FromLocalParquet(startTime, endTime);
     }
 
     @Test
     void testToMinio() {
         long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
         long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
-        String url = parquetService.toParquetAndUploadToMinio(startTime, endTime);
+        String url = parquetService.exportTable1ToMinio(startTime, endTime);
         log.info("url: {}", url);
     }
 
@@ -84,6 +84,6 @@ class ApplicationTests {
     void testReadMinio() {
         long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
         long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
-        parquetService.readParquetFromMinio(startTime, endTime);
+        parquetService.queryTable1FromMinioHive(startTime, endTime);
     }
 }
