@@ -82,8 +82,8 @@ class ApplicationTests {
 
     @Test
     void testReadMinio() {
-        long startTime = 1755619200000L;
-        long endTime = 1776646863240L;
+        long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
+        long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
         parquetService.readParquetFromMinio(startTime, endTime);
     }
 }
