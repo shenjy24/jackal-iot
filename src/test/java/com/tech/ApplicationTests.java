@@ -15,6 +15,10 @@ import java.util.List;
 @SpringBootTest
 class ApplicationTests {
 
+    static {
+        Application.initIoTDBTrustStore();
+    }
+
     @Autowired
     private Table1Service table1Service;
 

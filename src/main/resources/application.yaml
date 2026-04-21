@@ -1,9 +1,16 @@
 spring:
   datasource:
-    url: jdbc:iotdb://8.138.14.210:6667/database1?sql_dialect=table
+    url: jdbc:iotdb://8.138.14.210:6667/database1
     username: root
     password: root
     driver-class-name: org.apache.iotdb.jdbc.IoTDBDriver
+    # 通过 Hikari data-source-properties 注入 SSL 参数，避免 Windows 路径出现在 URL 中被 IoTDB 解析器误判
+    hikari:
+      data-source-properties:
+        sql_dialect: "table"
+        use_ssl: "true"
+        trust_store: "${javax.net.ssl.trustStore}"
+        trust_store_pwd: "${javax.net.ssl.trustStorePassword:123456}"
 server:
   # 端口
   port: 8081
