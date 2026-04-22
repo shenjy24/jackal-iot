@@ -78,7 +78,7 @@ public class ParquetService {
     private static final int PARQUET_DICT_PAGE_SIZE = 512 * 1024;
     private static final long PARQUET_ROW_GROUP_SIZE = 8L * 1024 * 1024;
     private static final long SYNTHETIC_PACKET_INTERVAL_MS = 500L;
-    private static final long SYNTHETIC_DURATION_MS = ONE_HOUR_MS;
+    private static final long DEFAULT_SYNTHETIC_DURATION_MS = ONE_HOUR_MS;
 
     /**
      * {@code INSTALL httpfs} 写入本机 DuckDB 扩展目录，同一 JVM 内只需尝试一次（升级 DuckDB 版本后需重新拉取）。
@@ -111,14 +111,17 @@ public class ParquetService {
      * 造数规则：
      * <ul>
      *   <li>不查询 IoTDB</li>
-     *   <li>0.5 秒一个包，共 1 小时（7200 条）</li>
+     *   <li>0.5 秒一个包，时长由 {@code durationMs} 指定</li>
      * </ul>
      */
-    public void exportTable1ToLocalBinaryAndCompare() {
+    public void exportTable1ToLocalBinaryAndCompare(long durationMs) {
+        if (durationMs <= 0) {
+            throw new IllegalArgumentException("durationMs must be > 0");
+        }
         long alignedStart = floorToEast8Hour(System.currentTimeMillis());
-        long syntheticEndExclusive = alignedStart + SYNTHETIC_DURATION_MS;
+        long syntheticEndExclusive = alignedStart + durationMs;
         MillisRange range = new MillisRange(alignedStart, syntheticEndExclusive);
-        List<Table1Row> syntheticRows = buildSyntheticRowsForOneHour(alignedStart);
+        List<Table1Row> syntheticRows = buildSyntheticRows(alignedStart, durationMs);
         ExportSizeStats stats = exportRowsToLocalParquetAndBinary(range, syntheticRows);
         log.info(
                 "本地造数参数: start={}, endExclusive={}, rows={}, intervalMs={}, durationMs={}",
@@ -126,7 +129,7 @@ public class ParquetService {
                 syntheticEndExclusive,
                 syntheticRows.size(),
                 SYNTHETIC_PACKET_INTERVAL_MS,
-                SYNTHETIC_DURATION_MS
+                durationMs
         );
         if (stats.binaryBytes() <= 0) {
             log.info(
@@ -147,6 +150,10 @@ public class ParquetService {
                 stats.binaryBytes(),
                 parquetVsBinary
         );
+    }
+
+    public void exportTable1ToLocalBinaryAndCompare() {
+        exportTable1ToLocalBinaryAndCompare(DEFAULT_SYNTHETIC_DURATION_MS);
     }
 
     public String exportTable1ToMinio(long startTime, long endTime) {
@@ -324,8 +331,8 @@ public class ParquetService {
         return new ExportSizeStats(parquetFileCount, binaryFileCount, parquetBytes, binaryBytes);
     }
 
-    private List<Table1Row> buildSyntheticRowsForOneHour(long startTime) {
-        int packets = (int) (SYNTHETIC_DURATION_MS / SYNTHETIC_PACKET_INTERVAL_MS);
+    private List<Table1Row> buildSyntheticRows(long startTime, long durationMs) {
+        int packets = (int) (durationMs / SYNTHETIC_PACKET_INTERVAL_MS);
         ArrayList<Table1Row> rows = new ArrayList<>(packets);
         for (int i = 0; i < packets; i++) {
             long ts = startTime + i * SYNTHETIC_PACKET_INTERVAL_MS;

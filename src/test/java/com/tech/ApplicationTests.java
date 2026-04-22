@@ -73,7 +73,7 @@ class ApplicationTests {
 
     @Test
     void testToBinaryAndCompare() {
-        parquetService.exportTable1ToLocalBinaryAndCompare();
+        parquetService.exportTable1ToLocalBinaryAndCompare(60_000L);
     }
 
     @Test
