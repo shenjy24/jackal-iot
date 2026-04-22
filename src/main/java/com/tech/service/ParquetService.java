@@ -5,11 +5,14 @@ import io.minio.BucketExistsArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.avro.AvroParquetWriter;
+import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.io.LocalOutputFile;
@@ -17,9 +20,8 @@ import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.io.PositionOutputStream;
 import org.springframework.stereotype.Service;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
+import javax.sql.DataSource;
+import java.io.*;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -38,6 +40,7 @@ import java.util.TreeMap;
  */
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class ParquetService {
 
     private static final String IOTDB_JDBC_URL = "jdbc:iotdb://8.138.14.210:6667/database1?sql_dialect=table";
@@ -50,6 +53,7 @@ public class ParquetService {
     private static final Path DIR;
     private static final long ONE_HOUR_MS = 3_600_000L;
     private static final long EAST8_OFFSET_MS = 8 * ONE_HOUR_MS;
+    private final DataSource dataSource;
 
     /**
      * DuckDB 读 MinIO 上 table1 的 Hive 布局通配路径。
@@ -68,6 +72,13 @@ public class ParquetService {
               ]
             }
             """;
+    private static final Schema TABLE1_SCHEMA = new Schema.Parser().parse(TABLE1_AVRO_SCHEMA);
+    private static final int PARQUET_ZSTD_LEVEL = 12;
+    private static final int PARQUET_PAGE_SIZE = 64 * 1024;
+    private static final int PARQUET_DICT_PAGE_SIZE = 512 * 1024;
+    private static final long PARQUET_ROW_GROUP_SIZE = 8L * 1024 * 1024;
+    private static final long SYNTHETIC_PACKET_INTERVAL_MS = 500L;
+    private static final long SYNTHETIC_DURATION_MS = ONE_HOUR_MS;
 
     /**
      * {@code INSTALL httpfs} 写入本机 DuckDB 扩展目录，同一 JVM 内只需尝试一次（升级 DuckDB 版本后需重新拉取）。
@@ -92,6 +103,50 @@ public class ParquetService {
         MillisRange range = MillisRange.ordered(startTime, endTime);
         int generated = exportTable1ToLocalPartitionFiles(range);
         log.info("本地分区 Parquet 导出完成: count={}, range=[{}, {}]", generated, startTime, endTime);
+    }
+
+    /**
+     * 本地造数并同时导出为 Parquet 与普通二进制文件，再比较二者文件大小。
+     * <p>
+     * 造数规则：
+     * <ul>
+     *   <li>不查询 IoTDB</li>
+     *   <li>0.5 秒一个包，共 1 小时（7200 条）</li>
+     * </ul>
+     */
+    public void exportTable1ToLocalBinaryAndCompare() {
+        long alignedStart = floorToEast8Hour(System.currentTimeMillis());
+        long syntheticEndExclusive = alignedStart + SYNTHETIC_DURATION_MS;
+        MillisRange range = new MillisRange(alignedStart, syntheticEndExclusive);
+        List<Table1Row> syntheticRows = buildSyntheticRowsForOneHour(alignedStart);
+        ExportSizeStats stats = exportRowsToLocalParquetAndBinary(range, syntheticRows);
+        log.info(
+                "本地造数参数: start={}, endExclusive={}, rows={}, intervalMs={}, durationMs={}",
+                alignedStart,
+                syntheticEndExclusive,
+                syntheticRows.size(),
+                SYNTHETIC_PACKET_INTERVAL_MS,
+                SYNTHETIC_DURATION_MS
+        );
+        if (stats.binaryBytes() <= 0) {
+            log.info(
+                    "本地导出完成: parquetFiles={}, parquetBytes={}, binaryFiles={}, binaryBytes={}",
+                    stats.parquetFileCount(),
+                    stats.parquetBytes(),
+                    stats.binaryFileCount(),
+                    stats.binaryBytes()
+            );
+            return;
+        }
+        double parquetVsBinary = (double) stats.parquetBytes() / stats.binaryBytes();
+        log.info(
+                "本地导出完成(Parquet vs Binary): parquetFiles={}, parquetBytes={}, binaryFiles={}, binaryBytes={}, parquet/binary={}",
+                stats.parquetFileCount(),
+                stats.parquetBytes(),
+                stats.binaryFileCount(),
+                stats.binaryBytes(),
+                parquetVsBinary
+        );
     }
 
     public String exportTable1ToMinio(long startTime, long endTime) {
@@ -151,14 +206,21 @@ public class ParquetService {
         if (rows.isEmpty()) {
             return 0;
         }
-        Schema schema = new Schema.Parser().parse(TABLE1_AVRO_SCHEMA);
+        Configuration conf = new Configuration(false);
+        conf.setInt("parquet.compression.codec.zstd.level", PARQUET_ZSTD_LEVEL);
         try (ParquetWriter<GenericRecord> writer =
                      AvroParquetWriter.<GenericRecord>builder(outputFile)
-                             .withSchema(schema)
+                             .withSchema(TABLE1_SCHEMA)
+                             .withConf(conf)
                              .withCompressionCodec(CompressionCodecName.ZSTD)
+                             .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
+                             .withDictionaryEncoding(true)
+                             .withPageSize(PARQUET_PAGE_SIZE)
+                             .withDictionaryPageSize(PARQUET_DICT_PAGE_SIZE)
+                             .withRowGroupSize(PARQUET_ROW_GROUP_SIZE)
                              .build()) {
             for (Table1Row row : rows) {
-                GenericRecord record = new GenericData.Record(schema);
+                GenericRecord record = new GenericData.Record(TABLE1_SCHEMA);
                 record.put("time", row.time());
                 record.put("device_id", row.deviceId());
                 record.put("temperature", row.temperature());
@@ -190,7 +252,7 @@ public class ParquetService {
 
     private int exportTable1ToLocalPartitionFiles(MillisRange range) {
         int exported = 0;
-        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD)) {
+        try (Connection conn = openIotDbConnection()) {
             List<Table1Row> allRows = fetchTable1Rows(conn, range);
             Map<Long, List<Table1Row>> rowsByHour = partitionRowsByEast8Hour(allRows);
             for (Map.Entry<Long, List<Table1Row>> entry : rowsByHour.entrySet()) {
@@ -220,9 +282,83 @@ public class ParquetService {
         return exported;
     }
 
+    private ExportSizeStats exportRowsToLocalParquetAndBinary(MillisRange range, List<Table1Row> rows) {
+        int parquetFileCount = 0;
+        int binaryFileCount = 0;
+        long parquetBytes = 0L;
+        long binaryBytes = 0L;
+        Map<Long, List<Table1Row>> rowsByHour = partitionRowsByEast8Hour(rows);
+        for (Map.Entry<Long, List<Table1Row>> entry : rowsByHour.entrySet()) {
+            long hourStartMs = entry.getKey();
+            long hourEndMs = hourStartMs + ONE_HOUR_MS;
+            String shardStart = TimeUtil.toCompactTimestamp(hourStartMs);
+            String shardEnd = TimeUtil.toCompactTimestamp(hourEndMs);
+            String date = TimeUtil.hiveDateValue(hourStartMs);
+            int hour = TimeUtil.hiveHourValue(hourStartMs);
+            Path partitionDir = DIR.resolve(buildPartitionDirForTable1(date, hour));
+            List<Table1Row> bucketRows = entry.getValue();
+            try {
+                Files.createDirectories(partitionDir);
+                Path parquetPath = partitionDir.resolve(buildTable1ParquetFilename(shardStart, shardEnd));
+                int parquetRows = writeRowsToParquet(new LocalOutputFile(parquetPath), bucketRows);
+                if (parquetRows > 0) {
+                    parquetFileCount++;
+                    parquetBytes += Files.size(parquetPath);
+                } else if (parquetRows == 0) {
+                    Files.deleteIfExists(parquetPath);
+                }
+
+                Path binaryPath = partitionDir.resolve(buildTable1BinaryFilename(shardStart, shardEnd));
+                int binaryRows = writeRowsToBinary(binaryPath, bucketRows);
+                if (binaryRows > 0) {
+                    binaryFileCount++;
+                    binaryBytes += Files.size(binaryPath);
+                } else if (binaryRows == 0) {
+                    Files.deleteIfExists(binaryPath);
+                }
+            } catch (IOException e) {
+                log.error("创建本地分区目录失败: {}", partitionDir, e);
+            }
+        }
+        log.debug("导出区间(用于目录命名/统计): [{} - {})", range.lo(), range.hi());
+        return new ExportSizeStats(parquetFileCount, binaryFileCount, parquetBytes, binaryBytes);
+    }
+
+    private List<Table1Row> buildSyntheticRowsForOneHour(long startTime) {
+        int packets = (int) (SYNTHETIC_DURATION_MS / SYNTHETIC_PACKET_INTERVAL_MS);
+        ArrayList<Table1Row> rows = new ArrayList<>(packets);
+        for (int i = 0; i < packets; i++) {
+            long ts = startTime + i * SYNTHETIC_PACKET_INTERVAL_MS;
+            String deviceIdPayload = "device-" + (i % 256);
+            double temperature = 20.0 + ((i % 400) * 0.01);
+            double humidity = 40.0 + ((i % 600) * 0.01);
+            rows.add(new Table1Row(ts, deviceIdPayload, temperature, humidity));
+        }
+        return rows;
+    }
+
+    private int writeRowsToBinary(Path path, List<Table1Row> rows) {
+        if (rows.isEmpty()) {
+            return 0;
+        }
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(path)))) {
+            for (Table1Row row : rows) {
+                out.writeLong(row.time());
+                byte[] deviceIdBytes = row.deviceId().getBytes();
+                out.write(deviceIdBytes);
+                out.writeDouble(row.temperature());
+                out.writeDouble(row.humidity());
+            }
+            return rows.size();
+        } catch (IOException e) {
+            log.error("二进制文件生成异常: {}", path, e);
+            return -1;
+        }
+    }
+
     private int exportTable1ToMinioPartitionFiles(MinioClient client, String bucketName, MillisRange range) {
         int uploaded = 0;
-        try (Connection conn = DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD)) {
+        try (Connection conn = openIotDbConnection()) {
             List<Table1Row> allRows = fetchTable1Rows(conn, range);
             Map<Long, List<Table1Row>> rowsByHour = partitionRowsByEast8Hour(allRows);
             for (Map.Entry<Long, List<Table1Row>> entry : rowsByHour.entrySet()) {
@@ -416,6 +552,16 @@ public class ParquetService {
                 .toString();
     }
 
+    private static String buildTable1BinaryFilename(String startCompact, String endCompact) {
+        return new StringBuilder(48)
+                .append("table1_")
+                .append(startCompact)
+                .append("_")
+                .append(endCompact)
+                .append(".bin")
+                .toString();
+    }
+
     /**
      * 按东八区整点将数据分桶：同一桶的记录都属于同一 date/hour 分区。
      */
@@ -456,6 +602,9 @@ public class ParquetService {
     }
 
     private record Table1Row(long time, String deviceId, Double temperature, Double humidity) {
+    }
+
+    private record ExportSizeStats(int parquetFileCount, int binaryFileCount, long parquetBytes, long binaryBytes) {
     }
 
     /**
@@ -511,6 +660,16 @@ public class ParquetService {
 
     private static String sqlStringLiteral(String s) {
         return s.replace("'", "''");
+    }
+
+    private Connection openIotDbConnection() throws SQLException {
+        try {
+            return dataSource.getConnection();
+        } catch (SQLException e) {
+            // 回退到直连方式，便于在 DataSource 配置异常时快速定位问题。
+            log.warn("通过 Spring DataSource 获取 IoTDB 连接失败，回退 DriverManager 直连: {}", e.getMessage());
+            return DriverManager.getConnection(IOTDB_JDBC_URL, IOTDB_USER, IOTDB_PASSWORD);
+        }
     }
 
     private void queryTable1FromLocalHivePartitions(MillisRange range) {

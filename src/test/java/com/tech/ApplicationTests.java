@@ -72,6 +72,11 @@ class ApplicationTests {
     }
 
     @Test
+    void testToBinaryAndCompare() {
+        parquetService.exportTable1ToLocalBinaryAndCompare();
+    }
+
+    @Test
     void testReadParquet() {
         long startTime = TimeUtil.getTimestamp("2025-07-20 00:00:00");
         long endTime = TimeUtil.getTimestamp("2027-04-20 00:00:00");
